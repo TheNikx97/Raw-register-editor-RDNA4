@@ -5,6 +5,20 @@
 #If you use this tool and your GPU fails, do not claim warranty
 #You use this tool at your own risk, I am not responsible for any damage
 
+set -o pipefail
+
+#############################################
+# Paths / state files
+#############################################
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REGISTERS_CONF="$SCRIPT_DIR/registers.conf"
+LOG_FILE="$SCRIPT_DIR/register_editor.log"
+EEPROM_COUNT_FILE="$SCRIPT_DIR/.eeprom_write_count"
+LOCK_FILE="/tmp/raw_register_editor.lock"
+
+EEPROM_WARN_THRESHOLD=50
+
 #############################################
 # Global constants
 #############################################
@@ -23,6 +37,72 @@ bus_number=""
 
 I2C_DELAY=0.1
 I2C_RETRIES=5
+
+#############################################
+# CLI args
+#############################################
+
+READ_ONLY=0
+DUMP_FILE=""
+
+print_help() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+  --read-only          Print the register table once and exit (no writes possible)
+  --dump-file=PATH      Write a plain-text register dump to PATH and exit
+  -h, --help            Show this help
+
+With no options, starts the interactive raw register editor.
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --read-only) READ_ONLY=1 ;;
+    --dump-file=*) DUMP_FILE="${arg#--dump-file=}" ;;
+    -h|--help) print_help; exit 0 ;;
+    *)
+      echo "Unknown option: $arg"
+      print_help
+      exit 1
+      ;;
+  esac
+done
+
+#############################################
+# Logging
+#############################################
+
+log_action() {
+  local msg="$1"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >> "$LOG_FILE"
+}
+
+#############################################
+# Lock (prevent concurrent instances hammering the same i2c bus)
+#############################################
+
+acquire_lock() {
+  exec 200>"$LOCK_FILE"
+  if ! flock -n 200; then
+    echo -e "\033[1;31mAnother instance appears to be running (lock: $LOCK_FILE). Exiting.\033[0m"
+    exit 1
+  fi
+}
+
+#############################################
+# Cleanup trap: always leave VR page pointer at 0x00
+#############################################
+
+cleanup() {
+  # Best-effort, ignore failures (bus_number may not be set yet if we bail out early)
+  if [[ -n "$bus_number" ]]; then
+    i2c_set_page "$bus_number" "$vr1" 0x00 >/dev/null 2>&1
+    i2c_set_page "$bus_number" "$vr2" 0x00 >/dev/null 2>&1
+  fi
+}
+trap cleanup EXIT INT TERM
 
 #############################################
 # Setup functions
@@ -48,14 +128,14 @@ check_i2c_module() {
   fi
 }
 
-# Function to install i2c-tools and bc based on the detected OS
+# Function to install i2c-tools, bc and flock (util-linux) based on the detected OS
 install_i2c_tools() {
   if command -v apt-get &> /dev/null; then
     # Debian-based system (e.g., Ubuntu)
     if ! dpkg-query -W -f='${Status}' i2c-tools 2>/dev/null | grep -q "ok installed"; then
       sudo apt-get update
-      sudo apt-get install -y i2c-tools bc
-      echo "Installed i2c-tools and bc"
+      sudo apt-get install -y i2c-tools bc util-linux
+      echo "Installed i2c-tools, bc and util-linux"
     elif ! dpkg-query -W -f='${Status}' bc 2>/dev/null | grep -q "ok installed"; then
       sudo apt-get install -y bc
       echo "Installed bc"
@@ -65,8 +145,8 @@ install_i2c_tools() {
   elif command -v pacman &> /dev/null; then
     # Arch Linux
     if ! pacman -Q i2c-tools &> /dev/null; then
-      sudo pacman -Sy --noconfirm i2c-tools bc
-      echo "Installed i2c-tools and bc"
+      sudo pacman -Sy --noconfirm i2c-tools bc util-linux
+      echo "Installed i2c-tools, bc and util-linux"
     elif ! pacman -Q bc &> /dev/null; then
       sudo pacman -S --noconfirm bc
       echo "Installed bc"
@@ -81,8 +161,8 @@ install_i2c_tools() {
     fi
 
     if ! rpm -q i2c-tools &> /dev/null; then
-      sudo $package_manager install -y i2c-tools bc
-      echo "Installed i2c-tools and bc"
+      sudo $package_manager install -y i2c-tools bc util-linux
+      echo "Installed i2c-tools, bc and util-linux"
     elif ! rpm -q bc &> /dev/null; then
       sudo $package_manager install -y bc
       echo "Installed bc"
@@ -90,7 +170,12 @@ install_i2c_tools() {
       echo "i2c-tools and bc are already installed."
     fi
   else
-    echo -e "\033[1;31mUnsupported package manager. Please install i2c-tools and bc manually.\033[0m"
+    echo -e "\033[1;31mUnsupported package manager. Please install i2c-tools, bc and flock (util-linux) manually.\033[0m"
+    exit 1
+  fi
+
+  if ! command -v flock &> /dev/null; then
+    echo -e "\033[1;31mflock command not found. Please install util-linux.\033[0m"
     exit 1
   fi
 }
@@ -302,73 +387,202 @@ save_to_eeprom() {
 }
 
 #############################################
-# Raw Register Viewer / Editor
-# Shows a live table of the relevant VR registers
-# and lets the user write any value to any listed register,
-# with the option to permanently commit the current state to EEPROM.
+# mV conversion for range-checked fields
+# (generic two's-complement decode based on a bitmask, offset*5mV per step,
+# same convention as the original tool's VID/TRIM offset conversion)
 #############################################
 
-# Registry of all displayed registers:
-# Each entry: "VR  PAGE  REG  LABEL"
-REGISTER_TABLE=(
-  "$vr1  $page0  0x22  VR1/p0/TRIM"
-  "$vr1  $page0  0x23  VR1/p0/VID"
-  "$vr1  $page0  0x4b  VR1/p0/BACKUP1"
-  "$vr1  $page1  0x10  VR1/p1/BACKUP3"
-  "$vr1  $page1  0x23  VR1/p1/VID(VDDCI)"
-  "$vr1  $page1  0x4b  VR1/p1/BACKUP1"
-  "$vr1  $page1  0x4d  VR1/p1/BACKUP2"
-  "$vr1  $page2  0x06  VR1/p2/CG1"
-  "$vr1  $page2  0x08  VR1/p2/CG1_raw"
-  "$vr1  $page2  0x0c  VR1/p2/PG_hi"
-  "$vr1  $page2  0x0f  VR1/p2/PG"
-  "$vr2  $page0  0x23  VR2/p0/VID(SoC)"
-  "$vr2  $page0  0x4b  VR2/p0/BACKUP1"
-  "$vr2  $page1  0x10  VR2/p1/BACKUP3"
-  "$vr2  $page1  0x23  VR2/p1/VID(VRAM)"
-  "$vr2  $page1  0x4b  VR2/p1/BACKUP1"
-  "$vr2  $page1  0x4d  VR2/p1/BACKUP2"
-  "$vr2  $page2  0x0f  VR2/p2/PG"
-)
+convert_masked_to_mv() {
+  local raw="$1"
+  local mask="$2"
 
-# Prints the register table with index numbers and live values
+  raw=$((16#${raw#0x}))
+  mask=$((16#${mask#0x}))
+
+  local val=$(( raw & mask ))
+  local half=$(( (mask + 1) / 2 ))
+
+  if (( val >= half )); then
+    val=$(( val - (mask + 1) ))
+  fi
+
+  echo $(( val * 5 ))
+}
+
+#############################################
+# Register table (externalized to registers.conf)
+# Format per line (pipe-separated):
+#   VR|PAGE|REG|LABEL|MASK|MIN_MV|MAX_MV
+# MASK/MIN_MV/MAX_MV may be left empty for registers with no known safe range
+# (backup/PG/CG1 registers) - they are only range-checked/converted when set.
+#############################################
+
+generate_default_registers_conf() {
+  cat > "$REGISTERS_CONF" <<EOF
+# VR|PAGE|REG|LABEL|MASK|MIN_MV|MAX_MV
+# MASK/MIN_MV/MAX_MV are optional. When present, the register is treated as a
+# signed offset field (two's complement over MASK, 5mV/step) and writes
+# outside [MIN_MV,MAX_MV] require an explicit "override" to proceed.
+$vr1|$page0|0x22|VR1/p0/TRIM|0x7F|-50|50
+$vr1|$page0|0x23|VR1/p0/VID|0x1FF|-50|150
+$vr1|$page0|0x4b|VR1/p0/BACKUP1|||
+$vr1|$page1|0x10|VR1/p1/BACKUP3|||
+$vr1|$page1|0x23|VR1/p1/VID(VDDCI)|0x1FF|-50|100
+$vr1|$page1|0x4b|VR1/p1/BACKUP1|||
+$vr1|$page1|0x4d|VR1/p1/BACKUP2|||
+$vr1|$page2|0x06|VR1/p2/CG1|||
+$vr1|$page2|0x08|VR1/p2/CG1_raw|||
+$vr1|$page2|0x0c|VR1/p2/PG_hi|||
+$vr1|$page2|0x0f|VR1/p2/PG|||
+$vr2|$page0|0x23|VR2/p0/VID(SoC)|0x1FF|-50|100
+$vr2|$page0|0x4b|VR2/p0/BACKUP1|||
+$vr2|$page1|0x10|VR2/p1/BACKUP3|||
+$vr2|$page1|0x23|VR2/p1/VID(VRAM)|0x1FF|-100|135
+$vr2|$page1|0x4b|VR2/p1/BACKUP1|||
+$vr2|$page1|0x4d|VR2/p1/BACKUP2|||
+$vr2|$page2|0x0f|VR2/p2/PG|||
+EOF
+  echo "Created default register table: $REGISTERS_CONF"
+}
+
+REGISTER_TABLE=()
+
+load_register_table() {
+  if [[ ! -f "$REGISTERS_CONF" ]]; then
+    generate_default_registers_conf
+  fi
+
+  REGISTER_TABLE=()
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    REGISTER_TABLE+=("$line")
+  done < "$REGISTERS_CONF"
+
+  if [ ${#REGISTER_TABLE[@]} -eq 0 ]; then
+    echo -e "\033[1;31mNo registers loaded from $REGISTERS_CONF. Aborting.\033[0m"
+    exit 1
+  fi
+}
+
+parse_entry() {
+  # Splits a REGISTER_TABLE entry into the parse_* globals
+  local entry="$1"
+  IFS='|' read -r parse_vr parse_page parse_reg parse_label parse_mask parse_min parse_max <<< "$entry"
+}
+
+#############################################
+# Table display / dump
+#############################################
+
+# Prints the register table with index numbers and live values (to stdout, with colors)
 show_register_table() {
-  echo -e "\n\033[1;32m══════════════════════════════════════════════════════\033[0m"
+  echo -e "\n\033[1;32m═════════════════════════════════════════════════════════════════\033[0m"
   echo -e "\033[1;32m   Raw Register Table (live read from GPU)\033[0m"
-  echo -e "\033[1;32m══════════════════════════════════════════════════════\033[0m"
-  printf "  \033[1;37m%-4s %-6s %-6s %-6s  %-18s  %s\033[0m\n" \
-         "#" "VR" "PAGE" "REG" "LABEL" "VALUE"
-  echo -e "  ──────────────────────────────────────────────────────"
+  echo -e "\033[1;32m═════════════════════════════════════════════════════════════════\033[0m"
+  printf "  \033[1;37m%-4s %-6s %-6s %-6s  %-20s  %-8s %s\033[0m\n" \
+         "#" "VR" "PAGE" "REG" "LABEL" "VALUE" "mV"
+  echo -e "  ─────────────────────────────────────────────────────────────────"
 
   local i=0
   for entry in "${REGISTER_TABLE[@]}"; do
-    read -r vr page reg label <<< "$entry"
-    local val
-    val=$(i2c_read_register "$vr" "$page" "$reg" wp 2>/dev/null) || val="ERR"
-    printf "  \033[1;36m[%2d]\033[0m %-6s %-6s %-6s  %-18s  \033[1;33m%s\033[0m\n" \
-           "$i" "$vr" "$page" "$reg" "$label" "$val"
+    parse_entry "$entry"
+    local val mv_display=""
+    val=$(i2c_read_register "$parse_vr" "$parse_page" "$parse_reg" wp 2>/dev/null) || val="ERR"
+
+    if [[ -n "$parse_mask" && "$val" != "ERR" ]]; then
+      mv_display="$(convert_masked_to_mv "$val" "$parse_mask") mV"
+    fi
+
+    printf "  \033[1;36m[%2d]\033[0m %-6s %-6s %-6s  %-20s  \033[1;33m%-8s\033[0m %s\n" \
+           "$i" "$parse_vr" "$parse_page" "$parse_reg" "$parse_label" "$val" "$mv_display"
     (( i++ ))
   done
-  echo -e "  ──────────────────────────────────────────────────────"
+  echo -e "  ─────────────────────────────────────────────────────────────────"
+}
+
+# Plain-text dump (no ANSI colors) to a file, for --dump-file / scripting
+dump_register_table_to_file() {
+  local outfile="$1"
+
+  {
+    echo "RDNA4 VR raw register dump"
+    echo "Timestamp: $(date)"
+    echo "i2c bus: i2c-$bus_number ($I2C_BACKEND)"
+    echo
+    printf "%-4s %-6s %-6s %-6s %-20s %-8s %s\n" "#" "VR" "PAGE" "REG" "LABEL" "VALUE" "mV"
+
+    local i=0
+    for entry in "${REGISTER_TABLE[@]}"; do
+      parse_entry "$entry"
+      local val mv_display=""
+      val=$(i2c_read_register "$parse_vr" "$parse_page" "$parse_reg" wp 2>/dev/null) || val="ERR"
+      if [[ -n "$parse_mask" && "$val" != "ERR" ]]; then
+        mv_display="$(convert_masked_to_mv "$val" "$parse_mask") mV"
+      fi
+      printf "%-4s %-6s %-6s %-6s %-20s %-8s %s\n" "$i" "$parse_vr" "$parse_page" "$parse_reg" "$parse_label" "$val" "$mv_display"
+      (( i++ ))
+    done
+  } > "$outfile"
+
+  echo "Dump written to $outfile"
+}
+
+#############################################
+# EEPROM write-cycle counter
+#############################################
+
+get_eeprom_count() {
+  if [[ -f "$EEPROM_COUNT_FILE" ]]; then
+    cat "$EEPROM_COUNT_FILE"
+  else
+    echo 0
+  fi
+}
+
+bump_eeprom_count() {
+  local count
+  count=$(get_eeprom_count)
+  count=$(( count + 1 ))
+  echo "$count" > "$EEPROM_COUNT_FILE"
+  echo "$count"
 }
 
 # Permanently commits the current values to EEPROM on both VR devices
 save_current_state_permanently() {
+  local current_count
+  current_count=$(get_eeprom_count)
+
   echo -e "\n\033[1;33m⚠  This will permanently write the CURRENT register state to EEPROM on both VR devices ($vr1, $vr2).\033[0m"
-  echo -e "\033[1;33m   This survives reboots/power cycles. Make sure the values above are what you want.\033[0m"
+  echo -e "\033[1;33m   This survives reboots/power cycles and consumes one EEPROM write cycle per device.\033[0m"
+  echo -e "\033[1;33m   EEPROM write cycles recorded so far by this tool: $current_count\033[0m"
+  if (( current_count >= EEPROM_WARN_THRESHOLD )); then
+    echo -e "\033[1;31m   You have already performed $current_count EEPROM commits. VR EEPROMs have a limited write endurance -\033[0m"
+    echo -e "\033[1;31m   repeated commits increase the risk of wear. Only proceed if you specifically intend to.\033[0m"
+  fi
   read -rp "Type 'yes' to confirm: " confirm
   if [[ "$confirm" != "yes" ]]; then
     echo "Aborted."
+    log_action "EEPROM save aborted by user (count would have been $((current_count+1)))"
     sleep 1
     return
   fi
 
-  save_to_eeprom "$vr1"
-  save_to_eeprom "$vr2"
+  if save_to_eeprom "$vr1" && save_to_eeprom "$vr2"; then
+    local new_count
+    new_count=$(bump_eeprom_count)
+    log_action "EEPROM save OK on $vr1,$vr2 (cumulative count: $new_count)"
+    echo -e "\033[1;36mCumulative EEPROM write count: $new_count\033[0m"
+  else
+    log_action "EEPROM save FAILED on $vr1 and/or $vr2"
+    echo -e "\033[1;31mEEPROM save failed - check connection and try again.\033[0m"
+  fi
   sleep 2
 }
 
+#############################################
 # Interactive raw register editor loop
+#############################################
+
 raw_register_editor() {
   while true; do
     echo -e "\033[H\033[J"
@@ -407,8 +621,9 @@ raw_register_editor() {
     fi
 
     # Parse the chosen entry
-    local entry="${REGISTER_TABLE[$idx]}"
-    read -r sel_vr sel_page sel_reg sel_label <<< "$entry"
+    parse_entry "${REGISTER_TABLE[$idx]}"
+    local sel_vr="$parse_vr" sel_page="$parse_page" sel_reg="$parse_reg" sel_label="$parse_label"
+    local sel_mask="$parse_mask" sel_min="$parse_min" sel_max="$parse_max"
 
     # Read current value
     local cur_val
@@ -416,6 +631,9 @@ raw_register_editor() {
 
     echo -e "\n\033[1;37mSelected:\033[0m  VR=$sel_vr  page=$sel_page  reg=$sel_reg  label=$sel_label"
     echo -e "\033[1;37mCurrent value:\033[0m  \033[1;33m$cur_val\033[0m"
+    if [[ -n "$sel_mask" && "$cur_val" != "ERR" ]]; then
+      echo -e "\033[1;37mCurrent (decoded):\033[0m  \033[1;33m$(convert_masked_to_mv "$cur_val" "$sel_mask") mV\033[0m  (known-safe range: ${sel_min}..${sel_max} mV)"
+    fi
     echo -e "\n⚠  Enter new value as 0xNNNN (16-bit hex word), or [Enter] to cancel:"
     read -rp "> " new_val
 
@@ -436,12 +654,38 @@ raw_register_editor() {
     local norm_val
     norm_val=$(printf "0x%04X" $(( new_val )) )
 
-    echo -e "\n\033[1;33mAbout to write $norm_val to $sel_label (VR=$sel_vr page=$sel_page reg=$sel_reg)\033[0m"
-    read -rp "Confirm? Type 'yes' to proceed: " confirm
-    if [[ "$confirm" != "yes" ]]; then
-      echo "Aborted."
-      sleep 1
-      continue
+    # Range check (only for registers with a known-safe mV range defined)
+    if [[ -n "$sel_mask" && -n "$sel_min" && -n "$sel_max" ]]; then
+      local new_mv
+      new_mv=$(convert_masked_to_mv "$norm_val" "$sel_mask")
+      echo -e "\n\033[1;37mNew value decodes to:\033[0m \033[1;33m${new_mv} mV\033[0m  (known-safe range: ${sel_min}..${sel_max} mV)"
+
+      if (( new_mv < sel_min || new_mv > sel_max )); then
+        echo -e "\033[1;31m⚠  This is OUTSIDE the known-safe range for $sel_label.\033[0m"
+        read -rp "Type 'override' to force this write anyway, or anything else to cancel: " ov
+        if [[ "$ov" != "override" ]]; then
+          echo "Cancelled."
+          log_action "WRITE cancelled (out of range) vr=$sel_vr page=$sel_page reg=$sel_reg label=$sel_label old=$cur_val attempted=$norm_val (${new_mv}mV)"
+          sleep 1
+          continue
+        fi
+      else
+        read -rp "Confirm? Type 'yes' to proceed: " confirm
+        if [[ "$confirm" != "yes" ]]; then
+          echo "Aborted."
+          sleep 1
+          continue
+        fi
+      fi
+    else
+      echo -e "\n\033[1;33mAbout to write $norm_val to $sel_label (VR=$sel_vr page=$sel_page reg=$sel_reg)\033[0m"
+      echo -e "\033[1;33m(No known-safe range defined for this register - proceed carefully.)\033[0m"
+      read -rp "Confirm? Type 'yes' to proceed: " confirm
+      if [[ "$confirm" != "yes" ]]; then
+        echo "Aborted."
+        sleep 1
+        continue
+      fi
     fi
 
     if i2c_write_register "$sel_vr" "$sel_page" "$sel_reg" "$norm_val" wp; then
@@ -449,8 +693,11 @@ raw_register_editor() {
       local readback
       readback=$(i2c_read_register "$sel_vr" "$sel_page" "$sel_reg" wp 2>/dev/null) || readback="ERR"
       echo -e "\033[1;36m[✓ ]\033[0m Written. Readback: \033[1;32m$readback\033[0m"
+      echo -e "\033[1;37mDiff:\033[0m  $cur_val  \033[1;37m->\033[0m  \033[1;32m$readback\033[0m"
+      log_action "WRITE OK vr=$sel_vr page=$sel_page reg=$sel_reg label=$sel_label old=$cur_val new=$norm_val readback=$readback"
     else
       echo -e "\033[1;31m[✗ ] Write failed.\033[0m"
+      log_action "WRITE FAILED vr=$sel_vr page=$sel_page reg=$sel_reg label=$sel_label old=$cur_val attempted=$norm_val"
     fi
     sleep 2
   done
@@ -459,6 +706,9 @@ raw_register_editor() {
 #############################################
 # Main execution flow
 #############################################
+
+acquire_lock
+
 echo -e "\033[H\033[J"
 export LC_NUMERIC=C
 detect_os
@@ -466,8 +716,24 @@ check_i2c_module
 install_i2c_tools
 find_i2c_bus
 gpu_check
+load_register_table
+
+log_action "Session started (bus=i2c-$bus_number backend=$I2C_BACKEND read_only=$READ_ONLY)"
+
+if [[ -n "$DUMP_FILE" ]]; then
+  dump_register_table_to_file "$DUMP_FILE"
+  log_action "Session ended (dump-file mode)"
+  exit 0
+fi
+
+if (( READ_ONLY )); then
+  show_register_table
+  log_action "Session ended (read-only mode)"
+  exit 0
+fi
 
 raw_register_editor
 
+log_action "Session ended"
 echo "Exiting..."
 exit 0
